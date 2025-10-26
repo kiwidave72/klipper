@@ -6,6 +6,10 @@
 import math, logging
 import stepper, chelper
 
+# Route faults via named policies (printer | sandbox_latch | ...)
+from fault_policy import make_policy
+
+
 class ExtruderStepper:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -207,9 +211,20 @@ class PrinterExtruder:
         return self.heater.stats(eventtime)
     def check_move(self, move, ea_index):
         if not self.heater.can_extrude:
-            raise self.printer.command_error(
-                "Extrude below minimum temp\n"
-                "See the 'min_extrude_temp' config option for details")
+            # Route through policy. Default "printer" will shutdown; sandbox
+            # policies can latch locally. We still raise a command_error after
+            # the policy call to block the move if the policy doesn't shutdown.
+            try:
+                mcu = self.heater.mcu_pwm.get_mcu() if hasattr(self.heater, 'mcu_pwm') else None
+            except Exception:
+                mcu = None
+            pname = getattr(mcu, 'get_fault_policy_name', lambda: 'printer')()
+            msg = ("Extrude below minimum temp\n"
+                   "See the 'min_extrude_temp' config option for details")
+            make_policy(self.printer, pname).trip(
+                code="COLD_EXTRUDE", msg=msg, heater=self.heater, mcu=mcu
+            )
+            raise self.printer.command_error(msg)
         axis_r = move.axes_r[ea_index]
         axis_d = move.axes_d[ea_index]
         if (not move.axes_d[0] and not move.axes_d[1]) or axis_r < 0.:

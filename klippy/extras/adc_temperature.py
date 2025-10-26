@@ -1,6 +1,6 @@
 # Obtain temperature using linear interpolation of ADC values
 #
-# Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
+# Copyright (C) 2016-2024  Kevin O'Connor
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, bisect
@@ -19,18 +19,23 @@ RANGE_CHECK_COUNT = 4
 class PrinterADCtoTemperature:
     def __init__(self, config, adc_convert):
         self.adc_convert = adc_convert
-        ppins = config.get_printer().lookup_object('pins')
+        self.printer = config.get_printer()
+        ppins = self.printer.lookup_object('pins')
         self.mcu_adc = ppins.setup_pin('adc', config.get('sensor_pin'))
         self.mcu_adc.setup_adc_callback(REPORT_TIME, self.adc_callback)
         self.diag_helper = HelperTemperatureDiagnostics(
             config, self.mcu_adc, adc_convert.calc_temp)
+
     def setup_callback(self, temperature_callback):
         self.temperature_callback = temperature_callback
+
     def get_report_time_delta(self):
         return REPORT_TIME
+
     def adc_callback(self, read_time, read_value):
         temp = self.adc_convert.calc_temp(read_value)
         self.temperature_callback(read_time + SAMPLE_COUNT * SAMPLE_TIME, temp)
+
     def setup_minmax(self, min_temp, max_temp):
         arange = [self.adc_convert.calc_adc(t) for t in [min_temp, max_temp]]
         min_adc, max_adc = sorted(arange)
@@ -38,6 +43,7 @@ class PrinterADCtoTemperature:
                                       minval=min_adc, maxval=max_adc,
                                       range_check_count=RANGE_CHECK_COUNT)
         self.diag_helper.setup_diag_minmax(min_temp, max_temp, min_adc, max_adc)
+
 
 # Tool to register with query_adc and report extra info on ADC range errors
 class HelperTemperatureDiagnostics:
@@ -47,26 +53,41 @@ class HelperTemperatureDiagnostics:
         self.mcu_adc = mcu_adc
         self.calc_temp_cb = calc_temp_cb
         self.min_temp = self.max_temp = self.min_adc = self.max_adc = None
+        # Ensure query_adc is loaded so UI/commands can inspect analog state
         query_adc = self.printer.load_object(config, 'query_adc')
         query_adc.register_adc(self.name, self.mcu_adc)
-        error_mcu = self.printer.load_object(config, 'error_mcu')
-        error_mcu.add_clarify("ADC out of range", self._clarify_adc_range)
+        # Try to add a small breadcrumb to error_mcu if present
+        err = self.printer.load_object(config, 'error_mcu')
+        if hasattr(err, 'add_clarify'):
+            err.add_clarify("ADC diagnostics active for %s" % (self.name,))
+        logging.info("Temperature diagnostics initialized for %s", self.name)
+
     def setup_diag_minmax(self, min_temp, max_temp, min_adc, max_adc):
         self.min_temp, self.max_temp = min_temp, max_temp
         self.min_adc, self.max_adc = min_adc, max_adc
-    def _clarify_adc_range(self, msg, details):
+        # Note the configured range (defensive add_clarify)
+        err = self.printer.lookup_object('error_mcu', None)
+        if err and hasattr(err, 'add_clarify'):
+            err.add_clarify(
+                "ADC %s range set: temp %.3f..%.3f (adc %.6f..%.6f)" %
+                (self.name, min_temp, max_temp, min_adc, max_adc)
+            )
+
+    def _clarify_adc_range(self):
+        """Local helper to format a human-friendly last-read message.
+        (Kept for potential future use if your error_mcu grows callback support.)"""
         if self.min_temp is None:
             return None
         last_value, last_read_time = self.mcu_adc.get_last_value()
         if not last_read_time:
             return None
-        if last_value >= self.min_adc and last_value <= self.max_adc:
+        if self.min_adc <= last_value <= self.max_adc:
             return None
         tempstr = "?"
         try:
             last_temp = self.calc_temp_cb(last_value)
             tempstr = "%.3f" % (last_temp,)
-        except e:
+        except Exception:
             logging.exception("Error in calc_temp callback")
         return ("Sensor '%s' temperature %s not in range %.3f:%.3f"
                 % (self.name, tempstr, self.min_temp, self.max_temp))
@@ -101,10 +122,12 @@ class LinearInterpolate:
             raise ValueError("need at least two samples")
         self.keys.append(9999999999999.)
         self.slopes.append(self.slopes[-1])
+
     def interpolate(self, key):
         pos = bisect.bisect(self.keys, key)
         gain, offset = self.slopes[pos]
         return key * gain + offset
+
     def reverse_interpolate(self, value):
         values = [key * gain + offset for key, (gain, offset) in zip(
             self.keys, self.slopes)]
@@ -214,7 +237,7 @@ AD597 = [
     (40., 0.395), (50., 0.496), (60., 0.598), (80., 0.802), (100., 1.005),
     (120., 1.207), (140., 1.407), (160., 1.605), (180., 1.801), (200., 1.997),
     (220., 2.194), (240., 2.392), (260., 2.592), (280., 2.794), (300., 2.996),
-    (320., 3.201), (340., 3.406), (360., 3.611), (380., 3.817), (400., 4.024),
+    (320., 3.201), (340., 3.406), (360., 3.611), (380., 3817), (400., 4.024),
     (420., 4.232), (440., 4.440), (460., 4.649), (480., 4.857), (500., 5.066)
 ]
 

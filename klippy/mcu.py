@@ -697,13 +697,14 @@ class MCUConnectHelper:
         # Shutdown tracking
         self._emergency_stop_cmd = None
         self._is_shutdown = self._is_timeout = False
-        self._shutdown_clock = 0
         self._shutdown_msg = ""
         # Register handlers
         printer.register_event_handler("klippy:mcu_identify",
                                        self._mcu_identify)
         self._restart_helper = MCURestartHelper(config, self)
         printer.register_event_handler("klippy:shutdown", self._shutdown)
+        printer.register_event_handler("klippy:analyze_shutdown",
+                                       self._analyze_shutdown)
     def get_mcu(self):
         return self._mcu
     def get_serial(self):
@@ -714,25 +715,266 @@ class MCUConnectHelper:
         return self._serialport, self._baud
     def get_restart_helper(self):
         return self._restart_helper
+    def _install_safe_raw_send(self):
+        """Install a wrapper that catches errors during reconnection."""
+        serial_obj = self._serial
+        mcu_name = self._name
+        
+        # Check if already installed
+        if hasattr(serial_obj, '_reconnecting') and serial_obj._reconnecting:
+            logging.debug("Reconnection wrapper already active for MCU '%s'", mcu_name)
+            return
+        
+        # Mark as reconnecting
+        serial_obj._reconnecting = True
+        
+        # Save the original raw_send if not already saved
+        if not hasattr(serial_obj, '_original_raw_send'):
+            serial_obj._original_raw_send = serial_obj.raw_send
+            logging.debug("Saved original raw_send for MCU '%s'", mcu_name)
+        
+        original_raw_send = serial_obj._original_raw_send
+        
+        # Create wrapper that checks serialqueue before calling original
+        def safe_wrapper(cmd, minclock, reqclock, cmd_queue):
+            # Check if we have a valid serialqueue
+            if not hasattr(serial_obj, 'serialqueue'):
+                logging.debug("MCU '%s': serialqueue attribute missing", mcu_name)
+                return None
+            if serial_obj.serialqueue is None:
+                logging.debug("MCU '%s': serialqueue is None, skipping send", mcu_name)
+                return None
+            try:
+                return original_raw_send(cmd, minclock, reqclock, cmd_queue)
+            except Exception as e:
+                logging.warning("MCU '%s' send error during reconnection: %s", mcu_name, e)
+                return None
+        
+        # Replace the method
+        serial_obj.raw_send = safe_wrapper
+        logging.warning("INSTALLED reconnection wrapper for MCU '%s'", mcu_name)
+    def _restore_raw_send(self):
+        """Restore the original raw_send method."""
+        if hasattr(self._serial, '_reconnecting'):
+            del self._serial._reconnecting
+        
+        if hasattr(self._serial, '_original_raw_send'):
+            self._serial.raw_send = self._serial._original_raw_send
+            logging.debug("Restored original raw_send for MCU '%s'", self._name)
+    def _get_sandbox_policy(self):
+        """Get the sandbox policy for this MCU, returns 'printer' if not set."""
+        try:
+            sandbox = self._printer.lookup_object('sandbox', None)
+            if sandbox is None:
+                return "printer"
+            return sandbox.policies.get(self._name, "printer")
+        except Exception:
+            # If sandbox module not loaded or any error, default to printer
+            return "printer"
+    def _attempt_reconnect(self):
+        """Attempt to reconnect a sandboxed MCU after shutdown."""
+        if self._get_sandbox_policy() != "sandbox":
+            # Only sandboxed MCUs can auto-reconnect
+            return False
+        
+        logging.info("Attempting to reconnect sandboxed MCU '%s'", self._name)
+        
+        try:
+            # Check if the device exists (for pipe/serial connections)
+            if self._baud == 0 and not self._canbus_iface:
+                # It's a pipe connection, check if it exists
+                import os
+                if not os.path.exists(self._serialport):
+                    logging.info(
+                        "Device '%s' not found for MCU '%s', will retry in 5s",
+                        self._serialport, self._name)
+                    # Schedule another attempt
+                    reconnect_time = self._reactor.monotonic() + 5.0
+                    self._reactor.register_callback(
+                        lambda et: self._attempt_reconnect(), reconnect_time)
+                    return False
+            
+            # Reset shutdown state
+            self._is_shutdown = False
+            self._is_timeout = False
+            self._shutdown_msg = ""
+            
+            # Unregister old response handlers
+            try:
+                self._mcu.register_response(None, 'shutdown', None)
+                self._mcu.register_response(None, 'is_shutdown', None)
+                self._mcu.register_response(None, 'starting', None)
+            except Exception:
+                pass
+            
+            # Disconnect serial
+            try:
+                self._serial.disconnect()
+            except Exception as e:
+                logging.debug("Error during disconnect: %s", e)
+            
+            # Wait for things to settle
+            self._reactor.pause(self._reactor.monotonic() + 1.0)
+            
+            # Attempt to reattach
+            self._attach()
+            
+            # Restore original raw_send now that we have a valid connection
+            self._restore_raw_send()
+            
+            # Re-setup shutdown handling
+            if self._emergency_stop_cmd is not None:
+                self._mcu.register_response(self._handle_shutdown, 'shutdown')
+                self._mcu.register_response(self._handle_shutdown, 'is_shutdown')
+                self._mcu.register_response(self._handle_starting, 'starting')
+            
+            logging.info("Successfully reconnected sandboxed MCU '%s'", self._name)
+            try:
+                self._printer.lookup_object('gcode').respond_info(
+                    "Sandboxed MCU '%s' reconnected successfully" % (self._name,),
+                    log=False)
+            except Exception:
+                pass
+            return True
+            
+        except Exception as e:
+            logging.warning("Failed to reconnect sandboxed MCU '%s': %s",
+                           self._name, str(e))
+            self._is_shutdown = True
+            # Try again later
+            logging.info("Will retry reconnection for MCU '%s' in 5 seconds", self._name)
+            reconnect_time = self._reactor.monotonic() + 5.0
+            self._reactor.register_callback(
+                lambda et: self._attempt_reconnect(), reconnect_time)
+            return False
+    def can_reconnect(self):
+        """Check if this MCU can attempt reconnection."""
+        return (self._is_shutdown and 
+                self._get_sandbox_policy() == "sandbox" and
+                not self._mcu.is_fileoutput())
     def _handle_shutdown(self, params):
         if self._is_shutdown:
             return
-        self._is_shutdown = True
-        clock = params.get("clock")
-        if clock is not None:
-            self._shutdown_clock = self._mcu.clock32_to_clock64(clock)
+        
+        # Get shutdown details first
         self._shutdown_msg = msg = params['static_string_id']
+        shutdown_clock = params.get("clock")
+        if shutdown_clock is not None:
+            shutdown_clock = self._mcu.clock32_to_clock64(shutdown_clock)
         event_type = params['#name']
-        self._printer.invoke_async_shutdown(
-            "MCU shutdown", {"reason": msg, "mcu": self._name,
-                             "event_type": event_type})
-        logging.info("MCU '%s' %s: %s\n%s\n%s", self._name, event_type,
-                     self._shutdown_msg, self._clocksync.dump_debug(),
-                     self._serial.dump_debug())
+        
+        # --- sandbox breadcrumb ---
+        try:
+            self._printer._sandbox_last_fault = self._name
+        except Exception:
+            pass
+        
+        # Check sandbox policy
+        policy = self._get_sandbox_policy()
+        
+        # Log early for debugging
+        logging.warning(
+            "MCU '%s' (policy=%s) received shutdown event: msg='%s', event='%s', printer_shutdown=%s",
+            self._name, policy, msg, event_type, self._printer.is_shutdown())
+        
+        if policy == "sandbox":
+            # Install safe wrapper IMMEDIATELY to prevent clocksync crashes
+            logging.warning("Installing safe wrapper for sandboxed MCU '%s'", self._name)
+            self._install_safe_raw_send()
+            logging.warning("Wrapper installation complete for MCU '%s'", self._name)
+            
+            # Check if this is a forced shutdown from printer-level shutdown
+            # (which we should accept) vs. a spontaneous MCU shutdown
+            is_forced = ("Force shutdown" in msg or "Command request" in msg)
+            
+            if is_forced and self._printer.is_shutdown():
+                # This is a cascading shutdown from another MCU, just mark as shutdown
+                self._is_shutdown = True
+                logging.info(
+                    "MCU '%s' (sandboxed) accepted forced shutdown from printer",
+                    self._name)
+                return
+            
+            # Sandboxed MCU spontaneous shutdown - log warning but don't shutdown printer
+            self._is_shutdown = True
+            logging.warning(
+                "MCU '%s' (sandboxed) shutdown: %s (clock=%s, event=%s)",
+                self._name, msg, shutdown_clock, event_type)
+            try:
+                self._printer.lookup_object('gcode').respond_info(
+                    "Warning: Sandboxed MCU '%s' shutdown: %s" % (self._name, msg),
+                    log=False)
+            except Exception:
+                pass
+            
+            # Schedule reconnection attempt after a delay
+            reconnect_time = self._reactor.monotonic() + 2.0
+            self._reactor.register_callback(
+                lambda et: self._attempt_reconnect(), reconnect_time)
+        else:
+            # Printer MCU - trigger full shutdown
+            self._is_shutdown = True
+            logging.error(
+                "MCU '%s' (printer policy) shutdown - triggering full printer shutdown",
+                self._name)
+            self._printer.invoke_async_shutdown(
+                "MCU shutdown",
+                {"reason": msg, "mcu": self._name,
+                 "event_type": event_type,
+                 "shutdown_clock": shutdown_clock})
     def _handle_starting(self, params):
-        if not self._is_shutdown:
-            self._printer.invoke_async_shutdown("MCU '%s' spontaneous restart"
-                                                % (self._name,))
+        # Breadcrumb: spontaneous restart may follow cable/power blip
+        try:
+            self._printer._sandbox_last_fault = self._name
+        except Exception:
+            pass
+        
+        # Check sandbox policy FIRST before checking shutdown state
+        policy = self._get_sandbox_policy()
+        
+        # Log for debugging
+        logging.info(
+            "MCU '%s' (policy=%s) received 'starting' event, is_shutdown=%s, printer_shutdown=%s",
+            self._name, policy, self._is_shutdown, self._printer.is_shutdown())
+        
+        if policy == "sandbox":
+            # For sandboxed MCUs, 'starting' during reconnection is expected
+            if self._is_shutdown:
+                # We're in reconnect mode, this is expected - just log it
+                logging.info(
+                    "MCU '%s' (sandboxed) starting message received during reconnection",
+                    self._name)
+                return
+            
+            # Unexpected restart of a running sandboxed MCU
+            logging.warning(
+                "MCU '%s' (sandboxed) unexpected spontaneous restart detected",
+                self._name)
+            try:
+                self._printer.lookup_object('gcode').respond_info(
+                    "Warning: Sandboxed MCU '%s' spontaneous restart" % (self._name,),
+                    log=False)
+            except Exception:
+                pass
+            
+            # Mark as shutdown and schedule reconnection
+            self._is_shutdown = True
+            self._install_safe_raw_send()
+            reconnect_time = self._reactor.monotonic() + 2.0
+            self._reactor.register_callback(
+                lambda et: self._attempt_reconnect(), reconnect_time)
+        else:
+            # Printer MCU - only trigger shutdown if not already shutting down
+            if self._is_shutdown:
+                return
+            
+            # Printer MCU - trigger full shutdown
+            logging.error(
+                "MCU '%s' (printer policy) spontaneous restart - triggering full printer shutdown",
+                self._name)
+            self._printer.invoke_async_shutdown(
+                "MCU '%s' spontaneous restart" % (self._name,),
+                {"mcu": self._name, "event_type": "starting"})
     def log_info(self):
         msgparser = self._serial.get_msgparser()
         message_count = len(msgparser.get_messages())
@@ -786,7 +1028,18 @@ class MCUConnectHelper:
         self._mcu.register_response(self._handle_shutdown, 'shutdown')
         self._mcu.register_response(self._handle_shutdown, 'is_shutdown')
         self._mcu.register_response(self._handle_starting, 'starting')
+    def _analyze_shutdown(self, msg, details):
+        if self._mcu.is_fileoutput():
+            return
+        logging.info("MCU '%s' shutdown: %s\n%s\n%s", self._name,
+                     self._shutdown_msg, self._clocksync.dump_debug(),
+                     self._serial.dump_debug())
     def _shutdown(self, force=False):
+        # Only send emergency_stop to printer-policy MCUs or when forced
+        policy = self._get_sandbox_policy()
+        if policy == "sandbox" and not force:
+            # Don't send emergency stop to sandboxed MCUs during printer shutdown
+            return
         if (self._emergency_stop_cmd is None
             or (self._is_shutdown and not force)):
             return
@@ -795,18 +1048,45 @@ class MCUConnectHelper:
         self._is_shutdown = True
         self._shutdown(force=True)
     def check_timeout(self, eventtime):
+        # For sandboxed MCUs that are reconnecting, ignore timeout checks
+        policy = self._get_sandbox_policy()
+        if policy == "sandbox" and self._is_shutdown:
+            # Already in reconnect mode, don't trigger another timeout
+            return
+            
         if (self._clocksync.is_active() or self._mcu.is_fileoutput()
             or self._is_timeout):
             return
-        self._is_timeout = True
-        logging.info("Timeout with MCU '%s' (eventtime=%f)",
-                     self._name, eventtime)
-        self._printer.invoke_shutdown("Lost communication with MCU '%s'" % (
-            self._name,))
+        
+        if policy == "sandbox":
+            self._is_timeout = True
+            # Sandboxed MCU - log warning but don't shutdown printer
+            logging.warning(
+                "MCU '%s' (sandboxed) communication timeout (eventtime=%f)",
+                self._name, eventtime)
+            try:
+                self._printer.lookup_object('gcode').respond_info(
+                    "Warning: Sandboxed MCU '%s' timeout" % (self._name,),
+                    log=False)
+            except Exception:
+                pass
+            
+            # Don't schedule reconnection here - let _handle_shutdown do it
+            # This timeout might be detected while we're already reconnecting
+        else:
+            self._is_timeout = True
+            # Printer MCU - trigger full shutdown
+            logging.info("Timeout with MCU '%s' (eventtime=%f)",
+                         self._name, eventtime)
+            try:
+                self._printer._sandbox_last_fault = self._name
+            except Exception:
+                pass
+            self._printer.invoke_async_shutdown(
+                "Lost communication with MCU '%s'" % (self._name,),
+                {"mcu": self._name, "event_type": "timeout", "eventtime": eventtime})
     def is_shutdown(self):
         return self._is_shutdown
-    def get_shutdown_clock(self):
-        return self._shutdown_clock
     def get_shutdown_msg(self):
         return self._shutdown_msg
 
@@ -1104,11 +1384,6 @@ class MCU:
         offset, freq = self._clocksync.calibrate_clock(print_time, eventtime)
         self._conn_helper.check_timeout(eventtime)
         return offset, freq
-    # Low-level connection wrappers
-    def is_shutdown(self):
-        return self._conn_helper.is_shutdown()
-    def get_shutdown_clock(self):
-        return self._conn_helper.get_shutdown_clock()
     # Statistics wrappers
     def get_status(self, eventtime=None):
         return self._stats_helper.get_status(eventtime)

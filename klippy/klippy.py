@@ -8,6 +8,15 @@ import sys, os, gc, optparse, logging, time, collections, importlib
 import util, reactor, queuelogger, msgproto
 import gcode, configfile, pins, mcu, toolhead, webhooks
 
+# Debug support
+import debugpy
+debugpy.listen(("0.0.0.0", 5678))
+print("Debugger running!")
+
+# Original imports below
+
+
+
 message_ready = "Printer is ready"
 
 message_startup = """

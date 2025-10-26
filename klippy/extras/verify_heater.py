@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
+from fault_policy import make_policy
 
 HINT_THERMAL = """
 See the 'verify_heater' section in docs/Config_Reference.md
@@ -31,6 +32,7 @@ class HeaterCheck:
         self.last_target = self.goal_temp = self.error = 0.
         self.goal_systime = self.printer.get_reactor().NEVER
         self.check_timer = None
+
     def handle_connect(self):
         if self.printer.get_start_args().get('debugoutput') is not None:
             # Disable verify_heater if outputting to a debug file
@@ -40,10 +42,12 @@ class HeaterCheck:
         logging.info("Starting heater checks for %s", self.heater_name)
         reactor = self.printer.get_reactor()
         self.check_timer = reactor.register_timer(self.check_event, reactor.NOW)
+
     def handle_shutdown(self):
         if self.check_timer is not None:
             reactor = self.printer.get_reactor()
             reactor.update_timer(self.check_timer, reactor.NEVER)
+
     def check_event(self, eventtime):
         temp, target = self.heater.get_temp(eventtime)
         if temp >= target - self.hysteresis or target <= 0.:
@@ -83,10 +87,26 @@ class HeaterCheck:
             self.goal_temp = min(self.goal_temp, temp + self.heating_gain)
         self.last_target = target
         return eventtime + 1.
+
     def heater_fault(self):
         msg = "Heater %s not heating at expected rate" % (self.heater_name,)
         logging.error(msg)
-        self.printer.invoke_shutdown(msg + HINT_THERMAL)
+        # Resolve the MCU associated with this heater (if available)
+        mcu = None
+        try:
+            mcu_pwm = getattr(self.heater, 'mcu_pwm', None)
+            if mcu_pwm and hasattr(mcu_pwm, 'get_mcu'):
+                mcu = mcu_pwm.get_mcu()
+        except Exception:
+            mcu = None
+        # Use the MCU's selected fault policy (default "printer")
+        pname = getattr(mcu, 'get_fault_policy_name', lambda: 'printer')()
+        make_policy(self.printer, pname).trip(
+            code="HEATER_NOT_HEATING",
+            msg=msg + HINT_THERMAL,
+            heater=self.heater,
+            mcu=mcu
+        )
         return self.printer.get_reactor().NEVER
 
 def load_config_prefix(config):

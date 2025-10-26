@@ -7,6 +7,9 @@
 
 REPORT_TIME = 0.300
 
+# Route faults via named policies (printer | sandbox_latch | ...)
+from fault_policy import make_policy
+
 
 class PrinterSensorCombined:
     def __init__(self, config):
@@ -75,6 +78,54 @@ class PrinterSensorCombined:
     def get_report_time_delta(self):
         return REPORT_TIME
 
+    # --- policy helpers -------------------------------------------------
+
+    def _resolve_mcu_for_policy(self):
+        """Find an MCU related to this combined sensor.
+
+        Preference: any heater mcu_pwm -> mcu, else any sensor.mcu_adc/mcu/get_mcu.
+        """
+        # If one of the listed "sensors" is actually a Heater, prefer that MCU
+        for s in self.sensors:
+            try:
+                # Heater objects have mcu_pwm.get_mcu()
+                mcu_pwm = getattr(s, 'mcu_pwm', None)
+                if mcu_pwm and hasattr(mcu_pwm, 'get_mcu'):
+                    mcu = mcu_pwm.get_mcu()
+                    if mcu is not None:
+                        return mcu
+            except Exception:
+                pass
+
+        # Otherwise try to pull MCU from underlying sensor backends
+        for s in self.sensors:
+            try:
+                mcu_adc = getattr(s, 'mcu_adc', None)
+                if mcu_adc and hasattr(mcu_adc, 'get_mcu'):
+                    mcu = mcu_adc.get_mcu()
+                    if mcu is not None:
+                        return mcu
+                mcu = getattr(s, 'mcu', None)
+                if mcu is not None:
+                    return mcu
+                if hasattr(s, 'get_mcu'):
+                    mcu = s.get_mcu()
+                    if mcu is not None:
+                        return mcu
+            except Exception:
+                pass
+
+        return None
+
+    def _trip_policy(self, code, msg):
+        mcu = self._resolve_mcu_for_policy()
+        pname = getattr(mcu, 'get_fault_policy_name', lambda: 'printer')()
+        make_policy(self.printer, pname).trip(
+            code=code, msg=msg, heater=None, mcu=mcu
+        )
+
+    # --- temperature logic ----------------------------------------------
+
     def update_temp(self, eventtime):
         values = []
         for sensor in self.sensors:
@@ -84,10 +135,12 @@ class PrinterSensorCombined:
 
         # check if values are out of max_deviation range
         if (max(values) - min(values)) > self.max_deviation:
-            self.printer.invoke_shutdown(
-                "COMBINED SENSOR maximum deviation exceeded limit of %0.1f, "
-                "max sensor value %0.1f, min sensor value %0.1f."
-                % (self.max_deviation, max(values), min(values),))
+            self._trip_policy(
+                "COMBINED_SENSOR_DEVIATION",
+                ("COMBINED SENSOR maximum deviation exceeded limit of %0.1f, "
+                 "max sensor value %0.1f, min sensor value %0.1f.")
+                % (self.max_deviation, max(values), min(values))
+            )
 
         temp = self.apply_mode(values)
         if temp:
@@ -106,15 +159,19 @@ class PrinterSensorCombined:
 
         # check min / max temp values
         if self.last_temp < self.min_temp:
-            self.printer.invoke_shutdown(
-                "COMBINED SENSOR temperature %0.1f "
-                "below minimum temperature of %0.1f."
-                % (self.last_temp, self.min_temp,))
+            self._trip_policy(
+                "COMBINED_SENSOR_BELOW_MIN",
+                ("COMBINED SENSOR temperature %0.1f "
+                 "below minimum temperature of %0.1f.")
+                % (self.last_temp, self.min_temp)
+            )
         if self.last_temp > self.max_temp:
-            self.printer.invoke_shutdown(
-                "COMBINED SENSOR temperature %0.1f "
-                "above maximum temperature of %0.1f."
-                % (self.last_temp, self.max_temp,))
+            self._trip_policy(
+                "COMBINED_SENSOR_ABOVE_MAX",
+                ("COMBINED SENSOR temperature %0.1f "
+                 "above maximum temperature of %0.1f.")
+                % (self.last_temp, self.max_temp)
+            )
 
         # this is copied from temperature_host to enable time triggered updates
         # get mcu and measured / current(?) time
